@@ -9,27 +9,28 @@ import Foundation
 import Combine
 
 extension Publisher {
-    public func blockTillCompletion() throws -> Output {
+    public func blockTillCompletion(_ q: DispatchQueue) throws -> Output {
         let semaphore = DispatchSemaphore(value: 0)
         var result: Output?
         var failure: Failure?
         
-        var cancellable: Cancellable? = self.sink(receiveCompletion: { completion in
+        var cancellable: Cancellable?
+        cancellable = self.sink(receiveCompletion: { completion in
             switch completion {
             case .failure(let error):
                 failure = error
+                cancellable?.cancel()
                 semaphore.signal()
             case .finished:
                 ()
             }
         }) { value in
             result = value
+            cancellable?.cancel()
             semaphore.signal()
         }
         
         _ = semaphore.wait(timeout: .distantFuture)
-        
-        cancellable = nil
         
         if let result = result {
             return result
@@ -47,32 +48,36 @@ extension Publisher {
 // to see it run as long as 60 seconds).
 
 // Oh, and did I mention that it leaks memory too?
-public func pretendToQuery() -> Future<Data, Error>  {
+public func pretendToQuery(_ q : DispatchQueue) -> AnyPublisher<Data, Error> {
     let future = Future<Data, Error> { promise in
 
         // Change 0.0001 to 0.001 to decrease the odds of it crashing, and
         // make it easier to watch the memory leak.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.0001) {
-            let result = Data(count: 1024)
-            promise(.success(result))
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.0001) {
+            q.sync {
+                let result = Data(count: 1024)
+                promise(.success(result))
+            }
         }
     }
     
-    return future
+    return future.eraseToAnyPublisher() // .receive(on: q).eraseToAnyPublisher()
 }
 
 private let _workQueue = DispatchQueue(label: "com.deb.work", attributes: .concurrent)
 
 private func perpetualWorker(index: Int) {
     var ctr = 0
+    let q = DispatchQueue(label: "com.deb.worker.\(index)")
     while true {
         autoreleasepool {
-            let f = pretendToQuery()
-            let result = try! f.blockTillCompletion()
+            let f = pretendToQuery(q)
+            /*
+            let result = try! f.blockTillCompletion(q)
 
             if result.isEmpty {
                 fatalError("Got back empty data")
-            }
+            }*/
 
             ctr += 1
             if ctr % 100 == 0 {
