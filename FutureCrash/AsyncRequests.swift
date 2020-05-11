@@ -8,30 +8,40 @@
 import Foundation
 import Combine
 
+let lock1 = DispatchQueue(label: "xxx1")
+var bbb = -1
+func blockCtr() -> Int {
+    return lock1.sync { bbb }
+}
+
+func setBlockCtr(_ val: Int) {
+    lock1.sync { bbb = val }
+}
+
 extension Publisher {
-    public func blockTillCompletion(_ q: DispatchQueue) throws -> Output {
+    public func blockTillCompletion(q: DispatchQueue) throws -> Output {
         let semaphore = DispatchSemaphore(value: 0)
         var result: Output?
         var failure: Failure?
         
-        var cancellable: Cancellable?
-        cancellable = self.sink(receiveCompletion: { completion in
-            switch completion {
-            case .failure(let error):
-                failure = error
-                cancellable?.cancel()
+        let cancellable: Cancellable = q.sync {
+            self.sink(receiveCompletion: { completion in
+                switch completion {
+                case .failure(let error):
+                    failure = error
+                    semaphore.signal()
+                case .finished:
+                    ()
+                }
+            }) { value in
+                result = value
                 semaphore.signal()
-            case .finished:
-                ()
             }
-        }) { value in
-            result = value
-            cancellable?.cancel()
-            semaphore.signal()
         }
-        
+
         _ = semaphore.wait(timeout: .distantFuture)
-        
+        q.sync { cancellable.cancel() }
+
         if let result = result {
             return result
         }
@@ -40,58 +50,55 @@ extension Publisher {
     }
 }
 
-// In a real world example, this function would do a network query and deliver a result (e.g. Data, and HTTPResponse).
-// For now, just wait a few ticks and return some Data.
-
-// If you make a bunch of pretendToQuery() calls in parallel,
-// your program will crash after just a few seconds.  (I've yet
-// to see it run as long as 60 seconds).
-
-// Oh, and did I mention that it leaks memory too?
 public func pretendToQuery(_ q : DispatchQueue) -> AnyPublisher<Data, Error> {
-    let future = Future<Data, Error> { promise in
-
-        // Change 0.0001 to 0.001 to decrease the odds of it crashing, and
-        // make it easier to watch the memory leak.
+    let ps = PassthroughSubject<Data, Error>()
+    let task = {
         DispatchQueue.global().asyncAfter(deadline: .now() + 0.0001) {
             q.sync {
-                let result = Data(count: 1024)
-                promise(.success(result))
+                ps.send(Data(count: 1024))
             }
         }
     }
     
-    return future.eraseToAnyPublisher() // .receive(on: q).eraseToAnyPublisher()
+    return ps.receive(on: q).handleEvents(receiveSubscription: { _ in task() }).eraseToAnyPublisher()
 }
 
-private let _workQueue = DispatchQueue(label: "com.deb.work", attributes: .concurrent)
-
-private func perpetualWorker(index: Int) {
-    var ctr = 0
-    let q = DispatchQueue(label: "com.deb.worker.\(index)")
-    while true {
-        autoreleasepool {
-            let f = pretendToQuery(q)
-            /*
-            let result = try! f.blockTillCompletion(q)
-
-            if result.isEmpty {
-                fatalError("Got back empty data")
-            }*/
-
-            ctr += 1
-            if ctr % 100 == 0 {
-                print("Worker [\(index)]: reached", ctr)
+public func pretendToQueryUsingFuture(_ q : DispatchQueue) -> AnyPublisher<Data, Error> {
+    let future = Future<Data, Error> { promise in
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.0001) {
+            q.sync {
+                promise(.success(Data(count: 1024)))
             }
         }
     }
+    
+    return future.eraseToAnyPublisher()
+
 }
 
-private let maxWorkers = 8
+private func worker(index: Int, base: Int) {
+    let q = DispatchQueue(label: "com.deb.worker.\(index)")
+    for ctr in 0...5000 {
+        let f = pretendToQueryUsingFuture(q)
+        let data = try! f.blockTillCompletion(q: q)
+
+        if data.count != 1024 {
+            fatalError("Bad data result: \(data.count)")
+        }
+        if ctr % 100 == 0 {
+            print("[\(index)] Worker reached", ctr + base)
+        }
+    }
+    
+    DispatchQueue.global().async {
+        worker(index: index, base: base + 5000)
+    }
+}
+
 public func startWorkers() {
     for i in 0..<8 {
-        _workQueue.async {
-            perpetualWorker(index: i)
+        DispatchQueue.global().async {
+            worker(index: i, base: 0)
         }
     }
 }
